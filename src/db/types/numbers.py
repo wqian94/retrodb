@@ -3,13 +3,18 @@
 import db.rtype as rtype
 
 
-class Float(rtype.RType):
+# General numeric type class
+class Numeric(rtype.RType): pass
+
+
+# Concrete subclasses
+class Float(Numeric):
   @classmethod
   def default(cls):
     return 0.0
 
 
-class Int(rtype.RType):
+class Int(Numeric):
   @classmethod
   def default(cls):
     return 0

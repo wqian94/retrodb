@@ -7,10 +7,10 @@ import threading
 
 import db.errors as errors
 import db.rrecord as rrecord
-import db.rtable as rtable
+import db.types.subscribable as rpubsub
 
 
-def wrap(cls, clsname=None, no_rewrite=('__class__', '__init__')):
+def wrap(cls, clsname=None, no_rewrite=()):
   """
   Wraps a class so that all its inherited functions operate dynamically on the
   _value member variable. By default, the wrapped class also inherits the name
@@ -25,7 +25,7 @@ def wrap(cls, clsname=None, no_rewrite=('__class__', '__init__')):
     clsname (str): the desired name for the new class. Defaults to None, which
       indicates to use cls's name appended with '<retro>'
     no_rewrite (str): a list of functions that should not be (re)written.
-      Defaults to ('__class__', '__init__')
+      Defaults to an empty tuple
 
   Returns a class that is the wrapped version of cls.
   """
@@ -36,7 +36,10 @@ def wrap(cls, clsname=None, no_rewrite=('__class__', '__init__')):
       'See the documentation of rview.RView for details.'),
     '_wrapped_cls': cls,
   }
-  for name, func in inspect.getmembers(cls, predicate=inspect.isfunction):
+  modfuncs = ('__repr__', '__str__')
+  modfuncs = [(name, getattr(cls, name)) for name in modfuncs]
+  modfuncs += inspect.getmembers(cls, predicate=inspect.isfunction)
+  for name, func in modfuncs:
     if (name not in no_rewrite) and (not getattr(func, '_rwrapped', False)):
       attributes[name] = lambda self, *args, **kwargs: \
         getattr(self._value, name)(*args, **kwargs)
@@ -52,31 +55,30 @@ def wrap(cls, clsname=None, no_rewrite=('__class__', '__init__')):
 
 # Below is a set of wrapped classes that can be used to superclass retroactive
 # views.
-class RView(wrap(object, 'RView'), abc.ABC):
+class RView(wrap(object), rpubsub.Subscribable, abc.ABC):
+  PUBSUB_INITIAL_TIMEOUT = 0.1
+  PUBSUB_MAX_TIMEOUT = 10
+
   def __init__(self, obj, *args, **kwargs):
     """
-    Initializes a callback thread that waits on the given RView or RTable
-    object for publish-subscribe updates. This thread is stored in the
+    Initializes a callback thread that waits on the given Subscribable object
+    for publish-subscribe updates. This thread is stored in the
     _cb_thread member variable.
 
     Args:
-      obj (RView | RTable): a RView or RTable object on which to await for
-        pub-sub changes
-      args (list): positional argments to pass up the MRO chain
+      obj (subscribable): a Subscribable object on which to await for pub-sub
+        changes
+      args (tuple): positional argments to pass up the MRO chain
       kwargs (dict): keyword arguments to pass up the MRO chain
 
-    Raises a RViewInitException if obj is not a RView instance.
+    Raises a RViewInitException if obj is not a Subscribable object.
     """
-    super(self.__class__, self).__init__(*args, **kwargs)
+    super(RView, self).__init__(*args, **kwargs)
 
-    if (not isinstance(obj, RView)) and (not isinstance(obj, rtable.RTable)):
+    if not isinstance(obj, rpubsub.Subscribable):
       raise errors.RViewInitException(
-        'Parameter of type %s is not a RView or RTable object' % \
+        'Parameter of type %s is not a Subscribable object' % \
         obj.__class__.__name__)
-
-    # Subscribe to current state and apply
-    checkpoint, changes = obj.subscribe()
-    self._apply_changes(changes)
 
     # Signals for quiet exits
     self._pubsub_exit_event = threading.Event()  # Signal to exit
@@ -84,26 +86,30 @@ class RView(wrap(object, 'RView'), abc.ABC):
 
     # Start callback thread
     self._cb_thread = threading.Thread(
-      target=self._callback, args=(obj, checkpoint))
-    self._cb_thread.start()
+      target=self._callback, args=(obj, None))
 
   def __del__(self):
-    """ Does thread cleanup on the callback thread. """
-    self._pubsub_exit_event.set()
-    self._pubsub_exited_event.wait()
+    """ Calls free() to perform thread cleanup on the callback thread. """
+    super(RView, self).__del__()
+    self.free()
+
+  def _all_records(self):
+    return self._value
 
   def _apply_changes(self, changes):
     """
     Apply the changelist in changes to the current state.
 
     Args:
-      changes (list(rview.RViewChanges)): the list of changes
+      changes (list(rrecord.Record)): the list of changes
     """
-    for change in changes:
-      if rrecord.Record.INSERT == change.type:
+    for record in changes:
+      if rrecord.Record.INSERT == record.action:
         self._callback_insert(record)
-      elif rrecord.Record.DELETE == change.type:
+      elif rrecord.Record.DELETE == record.action:
         self._callback_delete(record)
+      elif rrecord.Record.ERASE == record.action:
+        self._callback_erase(record.time, record.records)
       else:  # Change type is not part of enumeration
         # TODO: handle this case
         pass
@@ -114,15 +120,24 @@ class RView(wrap(object, 'RView'), abc.ABC):
     callback is subscribing.
 
     Args:
-      obj (RView | RTable): the object that has already been verified to be of
-        type RView or RTable
+      obj (rpubsub.Subscribable): the object that has already been verified to
+        be Subscribable
       checkpoint (int): the initial marker for when the last set of changes
         were seen by this subscriber
     """
+    timeout = RView.PUBSUB_INITIAL_TIMEOUT
     while not self._pubsub_exit_event.is_set():
-      checkpoint, changes = obj.subscribe_since(checkpoint)
-      self._apply_changes(changes)
-    obj.unsubscribe()
+      new_checkpoint, changes = obj.subscribe(checkpoint, timeout=timeout)
+      if new_checkpoint == checkpoint:  # No changes
+        # Exponential backoff
+        timeout = min(RView.PUBSUB_MAX_TIMEOUT, 2 * timeout)
+      else:
+        # Reset exponential backoff
+        timeout = RView.PUBSUB_INITIAL_TIMEOUT
+        checkpoint = new_checkpoint
+        self._apply_changes(changes)
+    self._pubsub_exited_event.set()
+    obj.unsubscribe(checkpoint)
 
   @abc.abstractmethod
   def _callback_delete(self, record):
@@ -132,6 +147,18 @@ class RView(wrap(object, 'RView'), abc.ABC):
 
     Args:
       record (rrecord.Record): the deletion record to make
+    """
+    pass
+
+  @abc.abstractmethod
+  def _callback_erase(self, time, records):
+    """
+    Callback method for handling the case of rrecord.Record.ERASE for a single
+    change, invoking retroactive erasure.
+
+    Args:
+      time (int): the time at which these records were added
+      records (rrecord.Record): the records to retroactively erase
     """
     pass
 
@@ -146,25 +173,19 @@ class RView(wrap(object, 'RView'), abc.ABC):
     """
     pass
 
-  def subscribe(self):
-    """ Returns the current view as a checkpoint and changelist of records. """
-    pass
-
-  def subscribe_since(self, checkpoint):
+  def _start(self):
     """
-    Retrieves the changelist since the given checkpoint, along with a new
-    checkpoint.
-
-    Args:
-      checkpoint (int): the checkpoint marker at which to start generating the
-        changelist
-
-    Returns a new checkpoint and the changelist of the record changes since the
-    given checkpoint.
+    Starts the callback thread. Manually called by subclasses after
+    initialization, so that callbacks can be correctly completed.
     """
-    pass
+    self._cb_thread.start()
+
+  def free(self):
+    """ Performs cleanup, such as on the callback thread. """
+    self._pubsub_exit_event.set()
+    self._pubsub_exited_event.wait()
 
 
 # Some extended RView abstract subclasses
-class RViewIntegrable(RView, wrap(numbers.Integral, 'RViewIntegrable')): pass
-class RViewString(RView, wrap(str, 'RViewString')): pass
+class RViewIntegrable(RView, wrap(numbers.Integral)): pass
+class RViewString(RView, wrap(str)): pass

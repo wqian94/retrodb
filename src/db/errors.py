@@ -1,7 +1,13 @@
 """ Library for error classes. """
 
 
-class RTableInitException(Exception): pass
-class RTableInvalidFieldException(Exception): pass
-class RViewInitException(Exception): pass
-class RViewValueUninitializedException(Exception): pass
+# General Exception superclass
+class RException(Exception): pass
+
+
+# More concrete subclasses
+class RTableInitException(RException): pass
+class RTableInvalidFieldException(RException): pass
+class RTypeIncompatibleException(RException): pass
+class RViewInitException(RException): pass
+class RViewValueUninitializedException(RException): pass

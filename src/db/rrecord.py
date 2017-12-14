@@ -1,6 +1,7 @@
 """ Library for records in a database table. """
 
 import enum
+import functools
 
 
 class Record(object):
@@ -32,6 +33,17 @@ class Record(object):
       else:
         self._values[field] = coltype.default()
 
+  def __eq__(self, other):
+    """ Returns whether self and other represent the same record. """
+    return (other is not None) and \
+      (self._action == other._action) and \
+      (self._table == other._table) and \
+      (self._time == other._time) and \
+      functools.reduce(
+        lambda acc, field:
+          acc and (self._values[field] == other._values[field]),
+        self._table.schema.keys(), True)
+
   def __getitem__(self, field):
     """
     Retrieves the value in the given field.
@@ -42,6 +54,10 @@ class Record(object):
     Returns the value associated with the field.
     """
     return self._values[field]
+
+  def __len__(self):
+    """ Returns the number of field:value pairs. """
+    return len(self._values)
 
   def __repr__(self):
     """ Returns the string representation of this record. """
@@ -57,15 +73,27 @@ class Record(object):
       self._action.name, self._time,
       ', '.join('%s=%s' % (k, repr(v)) for k, v in self._values.items()))
 
-  def delete(self):
+  @property
+  def action(self):
+    """ Returns this record's action type, e.g. INSERT or DELETE. """
+    return self._action
+
+  def delete(self, time):
     """
     Associates this record with a record stating its deletion, and returns
     that record.
+
+    Args:
+      time (int): the time at which deletion takes effect
     """
-    drecord = Record(self._table, self._time, Record.DELETE, **self._values)
+    drecord = Record(self._table, time, Record.DELETE, **self._values)
     self._inversion = drecord
     drecord._inversion = self
     return drecord
+
+  def fields(self):
+    """ Returns the set of fields in this record. """
+    return self._values.keys()
 
   @property
   def time(self):
@@ -74,7 +102,39 @@ class Record(object):
 
 
 # Enum for the types of record actions changes
-RecordAction = enum.Enum('RecordAction', 'INSERT DELETE')
+RecordAction = enum.Enum('RecordAction', 'INSERT DELETE ERASE')
 for updatename, update in RecordAction.__members__.items():
   setattr(Record, updatename, update)
 del RecordAction
+
+
+class Erasure(Record):
+  """ Special subclass for representing erasures. """
+  def __init__(self, time, *records):
+    """
+    Generates the Erasure instance for the records, which were added at the
+    given time.
+
+    Args:
+      time (int): the time at which these records were added
+      records (tuple(Record)): the records to erase
+    """
+    self._action = Record.ERASE
+    self._inversion = None
+    self._records = records
+    self._table = None
+    self._time = time
+    self._values = dict(zip(range(len(records)), records))
+
+  def delete(self):
+    """
+    Erasures can't be undone, so calling this raises a
+    RErasureUndeletableException.
+    """
+    raise errors.RErasureUndeletableException(
+      'Cannot delete a %s' % self.type.name)
+
+  @property
+  def records(self):
+    """ Returns the records to be erased. """
+    return self._records

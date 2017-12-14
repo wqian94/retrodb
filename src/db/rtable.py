@@ -1,15 +1,21 @@
 """ Library for a retroactively-updatable database table. """
 
 import collections
-import random
+import functools
 import threading
 
 import db.errors as errors
 import db.rrecord as rrecord
 import db.rtype as rtype
+import db.types.numbers as rnum
+import db.types.subscribable as rpubsub
+
+# Views
+import db.views.select as rviewselect
+import db.views.sum as rviewsum
 
 
-class RTable(object):
+class RTable(rpubsub.Subscribable):
   """
   Retroactively-updatable database table implementation.
 
@@ -31,14 +37,11 @@ class RTable(object):
 
     Raises a RTableInitException if a column's type isn't a subclass of RType.
     """
+    super(RTable, self).__init__()
     self._schema = schema
     for coltype in schema.values():
       if not issubclass(coltype, rtype.RType):
         raise errors.RTableInitException('%s is not a RType' % coltype)
-
-    self._checkpoints = {}  # Checkpoints -> (historical stamps, refcount)
-    self._history = []  # Index = checkpoint_stamp - history_epoch
-    self._history_epoch = 0  # Current epoch of historical stamps
 
     self._records = collections.defaultdict(tuple)  # Keyed on time
     self._record_lock = threading.RLock()
@@ -57,50 +60,10 @@ class RTable(object):
       str(r) for records in self._records.values() for r in records)
     return 'RTable{\n\t[Schema: %s]\n\t%s\n}' % (schema_string, records_string)
 
-  def _generate_checkpoint(self, checkpoint=None):
-    """
-    Returns a new checkpoint that isn't in use, preferring the provided
-    checkpoint if it is not None.
-
-    Not thread-safe.
-
-    Args:
-      checkpoint (int): the preferred checkpoint to use. Defaults to None.
-
-    Returns a new, unused checkpoint.
-    """
-    while checkpoint in self._checkpoints:
-      checkpoint = random.randint(0, (1 << 64) - 1)
-    return checkpoint
-
-  def _checkpoint_history(self, checkpoint):
-    """
-    Returns the latest history element as a (record, checkpoint) pair. If there
-    is no latest record to checkpoint, the first element will be None. If there
-    is no checkpoint for that element yet, this attempts to use the provided
-    checkpoint, or if that is in use, this will create a new checkpoint.
-
-    Is thread-safe.
-
-    Args:
-      checkpoint (int): the preferred checkpoint to use
-
-    Returns a (record, checkpoint) pair for the latest history element.      
-    """
+  def _all_records(self):
     with self._record_lock:
-      # Only need to create a checkpoint when history does not exist, or there
-      # is no existing checkpoint for the latest history element.
-      if (not len(self._history)) or (self._history[-1][1] is None):
-        # Reaffirm our checkpoint
-        checkpoint = self._get_checkpoint(checkpoint=checkpoint)
-        if len(self._history):
-          self._history[-1][1] = checkpoint
-        else:
-          self._history[-1] = (None, checkpoint)
-        stamp = len(self._history) + self._history_epoch
-        self._checkpoint[checkpoint] = (stamp, 1)
-
-      return self._history[-1]
+      return functools.reduce(
+        lambda allrecords, some: allrecords + some, self._records.values(), ())
 
   def delete(self, time, record):
     """
@@ -109,14 +72,15 @@ class RTable(object):
 
     Args:
       time (int): the time at which we want to delete the record
-      record (Record): the record to delete
+      record (rrecord.Record): the record to delete
 
     Returns a reference to the record of the deletion.
     """
     with self._record_lock:
-      drecord = record.delete()
+      drecord = record.delete(time)
       self._records[time] += (drecord,)
-      self._history += ((drecord, None),)  # Record, checkpoint
+      self._add_to_history(drecord)
+      return drecord
 
   def erase(self, time):
     """
@@ -133,10 +97,11 @@ class RTable(object):
       erased = self._records[time]
       del self._records[time]
 
-      for index in range(len(self._history)):
-        if self._history[index] in erased:
-          self._history[index] = (None, self._history[index][1])
-
+      # Break inversion references
+      for record in erased:
+        if record._inversion and (record._inversion._inversion == record):
+          record._inversion._inversion = None
+      self._remove_from_history(*erased)
       return erased
 
   def insert(self, time, **values):
@@ -154,7 +119,7 @@ class RTable(object):
     Returns a reference to the associated record that was created.
 
     Raises a RTableInvalidFieldException if a field not in the schema is
-      specified.
+    specified.
     """
     invalid_fields = values.keys() - self._schema.keys()
     if len(invalid_fields):
@@ -165,7 +130,7 @@ class RTable(object):
     record = rrecord.Record(self, time, rrecord.Record.INSERT, **values)
     with self._record_lock:
       self._records[time] += (record,)
-      self._history += ((record, None),)  # Record, checkpoint
+      self._add_to_history(record)
       return record
 
   @property
@@ -173,54 +138,31 @@ class RTable(object):
     """ Access the table's schema. """
     return self._schema
 
-  def subscribe(self):
+  def select(self, time, *fields, predicates=()):
     """
-    Returns the current view as a changelist of records.
-
-    If a checkpoint association already exists, then this will use the existing
-    association. Otherwise, this will create a new association.
-    """
-    # Add non-threadsafe checkpoint generation to throw in a bit of time so
-    # that calls are more likely to disinterleave.
-    checkpoint = self._generate_checkpoint()
-
-    with self._record_lock:
-      _, checkpoint = self._checkpoint_history(checkpoint)
-      return checkpoint, ((self._records.values(),), ())
-
-  def subscribe_since(self, checkpoint):
-    """
-    Retrieves the changelist since the given checkpoint, along with a new
-    checkpoint.
+    Retrieves, as a tuple of dicts, the requested fields from the table.
 
     Args:
-      checkpoint (int): the checkpoint marker at which to start generating the
-        changelist
+      time (int): the time at which the selection is to be made
+      fields (tuple(str)): the names of the fields to retrieve
+      predicate (tuple(rpred.Predicate)): the predicates to enforce. Defaults
+        to ()
 
-    Returns a new checkpoint and the changelist of the record changes since the
-    given checkpoint.
+    Returns a tuple of dictionary objects, which is a tuple of the records'
+    selected fields.
     """
-    # Add non-threadsafe checkpoint generation to throw in a bit of time so
-    # that calls are more likely to disinterleave.
-    new_checkpoint = self._generate_checkpoint()
+    return rviewselect.Select(self, time, *fields, predicates=predicates)
 
-    with self._record_lock:
-      record, new_checkpoint = self._checkpoint_history(new_checkpoint)
-      stamp = self._checkpoint[new_checkpoint][0]  # Most recently-seen index
-      index = stamp - self._history_epoch
-      # Map and filter to retrieve non-None records
-      records = tuple(
-        filter(lambda r: r is not None,
-        map(lambda h: h[0],
-          self._history[index + 1:])))
-      self._checkpoint[new_checkpoint][1] += 1
+  def sum(self, time, field):
+    """
+    Retrieves a sum of the records along the given field.
 
-      self._checkpoint[checkpoint][1] -= 1
-      # If refcount is 0, delete the checkpoint and attempt to reap history
-      if not self._checkpoint[checkpoint][1]:
-        del self._checkpoint[checkpoint]
-        earliest = min(self._checkpoint.values())
-        if earliest - self._history_epoch:
-          self._history = self._history[earliest - self._history_epoch:]
-          self._history_epoch = earliest
-      return checkpoint, records
+    The schema type of the field must be a Numeric type.
+
+    Args:
+      time (int): the time at which the sum is to be computed
+      field (str): the field on which to compute the sum
+
+    Returns a Sum view of those fields in this table.
+    """
+    return rviewsum.Sum(self, time, field)
